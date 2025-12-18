@@ -1,0 +1,16 @@
+[package]
+name = "geode-cli-installer"
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
+
+[dependencies]
+colored = "3.0.0"
+homedir = "0.3.6"
+reqwest = { version = "0.12.26", features = ["blocking", "json", "rustls-tls"], default-features = false }
+serde_json = "1.0.145"
+zip = "6.0.0"
