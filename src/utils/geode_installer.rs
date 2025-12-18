@@ -1,8 +1,9 @@
 use crate::utils::steam_game_finder::SteamGameFinder;
+use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
 use serde_json::Value;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -148,7 +149,7 @@ impl GeodeInstaller {
     }
 
     fn download_file(&self, url: &str, output: &Path) -> Result<(), String> {
-        let mut response = self.client
+        let response = self.client
             .get(url)
             .send()
             .map_err(|e| format!("Download failed: {}", e))?;
@@ -157,12 +158,40 @@ impl GeodeInstaller {
             return Err(format!("HTTP error {}", response.status()));
         }
 
+        let total_size = response.content_length().unwrap_or(0);
+
+        let pb = ProgressBar::new(total_size);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("#>-")
+        );
+
         let mut file = File::create(output)
             .map_err(|e| format!("Failed to create file: {}", e))?;
 
-        response
-            .copy_to(&mut file)
-            .map_err(|e| format!("Failed to write file: {}", e))?;
+        let mut downloaded = 0u64;
+        let mut buffer = vec![0; 8192];
+
+        let mut reader = response;
+        loop {
+            let bytes_read = reader
+                .read(&mut buffer)
+                .map_err(|e| format!("Failed to read response: {}", e))?;
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            file.write_all(&buffer[..bytes_read])
+                .map_err(|e| format!("Failed to write file: {}", e))?;
+
+            downloaded += bytes_read as u64;
+            pb.set_position(downloaded);
+        }
+
+        pb.finish_with_message("Download complete");
 
         Ok(())
     }
