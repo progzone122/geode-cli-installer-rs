@@ -5,7 +5,7 @@ mod tests {
     #[test]
     fn test_steam_finder() {
         let finder = SteamGameFinder::new();
-        println!("Steam root: {:?}", finder.get_steam_root());
-        println!("Library folders: {:?}", finder.get_library_folders());
+        println!("Steam root: {:?}", finder.steam_root());
+        println!("Library folders: {:?}", finder.library_folders());
     }
 }

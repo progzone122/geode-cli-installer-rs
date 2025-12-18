@@ -4,13 +4,12 @@ use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
+#[allow(unused)]
 pub struct GameInfo {
-    #[allow(unused)]
     pub app_id: String,
-    pub game_path: Option<PathBuf>,
+    pub game_path: PathBuf,
     pub proton_prefix: Option<PathBuf>,
-    pub library_path: Option<PathBuf>,
-    pub found: bool,
+    pub library_path: PathBuf,
 }
 
 pub struct SteamGameFinder {
@@ -20,66 +19,159 @@ pub struct SteamGameFinder {
 
 impl SteamGameFinder {
     pub fn new() -> Self {
-        let steam_root = Self::find_steam_root().ok();
-        let library_folders = Self::initialize_library_folders(&steam_root);
+        let steam_root = Self::find_steam_root();
+        let library_folders = Self::discover_library_folders(&steam_root);
         
-        SteamGameFinder {
+        Self {
             steam_root,
             library_folders,
         }
     }
 
-    pub fn get_steam_root(&self) -> &Option<PathBuf> {
-        &self.steam_root
+    pub fn steam_root(&self) -> Option<&PathBuf> {
+        self.steam_root.as_ref()
     }
 
+
     #[allow(unused)]
-    pub fn get_library_folders(&self) -> &Vec<PathBuf> {
+    pub fn library_folders(&self) -> &[PathBuf] {
         &self.library_folders
     }
 
-    fn find_steam_root() -> Result<PathBuf, String> {
-        let home_dir = my_home()
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| String::from("Home dir is empty somehow"))?;
+    pub fn get_game_info(&self, app_id: &str) -> Option<GameInfo> {
+        let (game_path, library_path) = self.find_game_by_appid(app_id)?;
+        let proton_prefix = self.find_proton_prefix(app_id, Some(&library_path));
 
-        let possible_paths = vec![
-            home_dir.join(".steam").join("steam"),
-            home_dir.join(".steam").join("root"),
-            home_dir.join(".local").join("share").join("Steam"),
-            home_dir.join(".var").join("app").join("com.valvesoftware.Steam"), // let's be honest. Steam Flatpak users, do you hate urself?
-            home_dir.join(".var").join("app").join("com.valvesoftware.Steam").join("data").join("Steam"),
+        Some(GameInfo {
+            app_id: app_id.to_string(),
+            game_path,
+            library_path,
+            proton_prefix,
+        })
+    }
+
+    fn find_steam_root() -> Option<PathBuf> {
+        let home = my_home().ok()??;
+
+        let candidates = [
+            home.join(".steam/steam"),
+            home.join(".steam/root"),
+            home.join(".local/share/Steam"),
+            home.join(".var/app/com.valvesoftware.Steam"),
+            home.join(".var/app/com.valvesoftware.Steam/data/Steam"),
             PathBuf::from("/usr/share/steam"),
         ];
 
-        for path in possible_paths {
-            if path.exists() && path.join("steamapps").exists() {
-                return Ok(path);
-            }
-        }
-
-        Err(String::from("Can't find Steam root"))
+        candidates.into_iter()
+            .find(|path| path.exists() && path.join("steamapps").exists())
     }
 
-    fn parse_vdf_file(file_path: &PathBuf) -> HashMap<String, String> {
-        let mut result = HashMap::new();
-
-        if !file_path.exists() {
-            return result;
-        }
-
-        let content = match fs::read_to_string(file_path) {
-            Ok(c) => c,
-            Err(_) => return result,
+    fn discover_library_folders(steam_root: &Option<PathBuf>) -> Vec<PathBuf> {
+        let steam_root = match steam_root {
+            Some(root) => root,
+            None => return Vec::new(),
         };
 
-        let mut pos = 0;
-        Self::parse_vdf_recursive(&content, &mut pos, &mut result, String::new());
+        let mut folders = vec![steam_root.join("steamapps")];
+        folders.extend(Self::parse_library_folders_vdf(steam_root));
+        Self::deduplicate_paths(folders)
+    }
 
+    fn parse_library_folders_vdf(steam_root: &PathBuf) -> Vec<PathBuf> {
+        let library_file = steam_root.join("steamapps/libraryfolders.vdf");
+        if !library_file.exists() {
+            return Vec::new();
+        }
+
+        let data = VdfParser::parse_file(&library_file);
+        
+        data.iter()
+            .filter(|(key, _)| key.contains(".path"))
+            .filter_map(|(_, value)| {
+                let path = PathBuf::from(value).join("steamapps");
+                path.exists().then_some(path)
+            })
+            .collect()
+    }
+
+    fn deduplicate_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+        let mut seen = HashSet::new();
+        paths.into_iter()
+            .filter(|path| seen.insert(path.to_string_lossy().to_string()))
+            .collect()
+    }
+
+    fn find_game_by_appid(&self, app_id: &str) -> Option<(PathBuf, PathBuf)> {
+        for library_path in &self.library_folders {
+            if let Some(game_info) = self.check_library_for_game(library_path, app_id) {
+                return Some(game_info);
+            }
+        }
+        None
+    }
+
+    fn check_library_for_game(&self, library_path: &PathBuf, app_id: &str) -> Option<(PathBuf, PathBuf)> {
+        let acf_file = library_path.join(format!("appmanifest_{}.acf", app_id));
+        
+        if !acf_file.exists() {
+            return None;
+        }
+
+        let acf_data = VdfParser::parse_file(&acf_file);
+        let install_dir = acf_data.get("AppState.installdir")?;
+        let game_path = library_path.join("common").join(install_dir);
+        
+        game_path.exists().then_some((game_path, library_path.clone()))
+    }
+
+    fn find_proton_prefix(&self, app_id: &str, preferred_library: Option<&PathBuf>) -> Option<PathBuf> {
+        // Check preferred library first
+        if let Some(prefix) = preferred_library.and_then(|lib| Self::check_compatdata(lib, app_id)) {
+            return Some(prefix);
+        }
+
+        // Fall back to searching all libraries
+        self.library_folders.iter()
+            .find_map(|lib| Self::check_compatdata(lib, app_id))
+    }
+
+    fn check_compatdata(library_path: &PathBuf, app_id: &str) -> Option<PathBuf> {
+        let compatdata_path = library_path
+            .join("compatdata")
+            .join(app_id)
+            .join("pfx");
+        
+        compatdata_path.exists().then_some(compatdata_path)
+    }
+}
+
+impl Default for SteamGameFinder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// VDF (Valve Data Format) parser
+struct VdfParser;
+
+impl VdfParser {
+    fn parse_file(path: &PathBuf) -> HashMap<String, String> {
+        if !path.exists() {
+            return HashMap::new();
+        }
+
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return HashMap::new(),
+        };
+
+        let mut result = HashMap::new();
+        let mut pos = 0;
+        Self::parse_recursive(&content, &mut pos, &mut result, String::new());
         result
     }
 
-    fn parse_vdf_recursive(
+    fn parse_recursive(
         content: &str,
         pos: &mut usize,
         result: &mut HashMap<String, String>,
@@ -88,190 +180,103 @@ impl SteamGameFinder {
         let chars: Vec<char> = content.chars().collect();
 
         while *pos < chars.len() {
-            // Skip whitespace
-            while *pos < chars.len() && chars[*pos].is_whitespace() {
-                *pos += 1;
-            }
-
+            Self::skip_whitespace(&chars, pos);
+            
             if *pos >= chars.len() {
                 break;
             }
 
-            // Handle comments
-            if *pos + 1 < chars.len() && chars[*pos] == '/' && chars[*pos + 1] == '/' {
-                while *pos < chars.len() && chars[*pos] != '\n' {
-                    *pos += 1;
-                }
+            if Self::skip_comment(&chars, pos) {
                 continue;
             }
 
-            // Handle closing brace
-            if chars[*pos] == '}' {
-                *pos += 1;
+            if Self::handle_closing_brace(&chars, pos) {
                 return;
             }
 
-            // Handle opening brace
-            if chars[*pos] == '{' {
-                *pos += 1;
+            if Self::handle_opening_brace(&chars, pos) {
                 continue;
             }
 
-            // Parse key-value pairs
             if chars[*pos] == '"' {
-                *pos += 1;
-
-                // Read key
-                let mut key = String::new();
-                while *pos < chars.len() && chars[*pos] != '"' {
-                    key.push(chars[*pos]);
-                    *pos += 1;
-                }
-                *pos += 1;
-
-                // Skip whitespace
-                while *pos < chars.len() && chars[*pos].is_whitespace() {
-                    *pos += 1;
-                }
-
-                if *pos < chars.len() && chars[*pos] == '"' {
-                    // Read value
-                    *pos += 1;
-                    let mut value = String::new();
-                    while *pos < chars.len() && chars[*pos] != '"' {
-                        value.push(chars[*pos]);
-                        *pos += 1;
-                    }
-                    *pos += 1;
-
-                    let full_key = if prefix.is_empty() {
-                        key
-                    } else {
-                        format!("{}.{}", prefix, key)
-                    };
-                    result.insert(full_key, value);
-                } else if *pos < chars.len() && chars[*pos] == '{' {
-                    // Nested object
-                    *pos += 1;
-                    let new_prefix = if prefix.is_empty() {
-                        key
-                    } else {
-                        format!("{}.{}", prefix, key)
-                    };
-                    Self::parse_vdf_recursive(content, pos, result, new_prefix);
-                }
+                Self::parse_key_value(&chars, pos, result, &prefix, content);
             } else {
                 *pos += 1;
             }
         }
     }
 
-    fn initialize_library_folders(steam_root: &Option<PathBuf>) -> Vec<PathBuf> {
-        let steam_root = match steam_root {
-            Some(root) => root,
-            None => return Vec::new(),
-        };
-
-        let mut folders = vec![steam_root.join("steamapps")];
-
-        let library_file = steam_root.join("steamapps").join("libraryfolders.vdf");
-        if library_file.exists() {
-            let data = Self::parse_vdf_file(&library_file);
-
-            for (key, value) in data.iter() {
-                if (key.starts_with("libraryfolders.") && key.contains(".path"))
-                    || key.contains(".path")
-                {
-                    let path = PathBuf::from(value).join("steamapps");
-                    if path.exists() {
-                        folders.push(path);
-                    }
-                }
-            }
+    fn skip_whitespace(chars: &[char], pos: &mut usize) {
+        while *pos < chars.len() && chars[*pos].is_whitespace() {
+            *pos += 1;
         }
-
-        // Remove duplicates
-        let mut unique_paths = HashSet::new();
-        let mut unique_folders = Vec::new();
-
-        for folder in folders {
-            let path_str = folder.to_string_lossy().to_string();
-            if !unique_paths.contains(&path_str) {
-                unique_paths.insert(path_str);
-                unique_folders.push(folder);
-            }
-        }
-
-        unique_folders
     }
 
-    pub fn find_game_by_appid(&self, app_id: &str) -> Option<(PathBuf, PathBuf)> {
-        for library_path in &self.library_folders {
-            let acf_file = library_path.join(format!("appmanifest_{}.acf", app_id));
-
-            if acf_file.exists() {
-                let acf_data = Self::parse_vdf_file(&acf_file);
-
-                if let Some(install_dir) = acf_data.get("AppState.installdir") {
-                    let game_path = library_path.join("common").join(install_dir);
-
-                    if game_path.exists() {
-                        return Some((game_path, library_path.clone()));
-                    }
-                }
+    fn skip_comment(chars: &[char], pos: &mut usize) -> bool {
+        if *pos + 1 < chars.len() && chars[*pos] == '/' && chars[*pos + 1] == '/' {
+            while *pos < chars.len() && chars[*pos] != '\n' {
+                *pos += 1;
             }
+            return true;
         }
-
-        None
+        false
     }
 
-    pub fn find_proton_prefix(
-        &self,
-        app_id: &str,
-        library_path: Option<&PathBuf>,
-    ) -> Option<PathBuf> {
-        if let Some(lib_path) = library_path {
-            let compatdata_path = lib_path
-                .join("compatdata")
-                .join(app_id)
-                .join("pfx");
-            if compatdata_path.exists() {
-                return Some(compatdata_path);
-            }
+    fn handle_closing_brace(chars: &[char], pos: &mut usize) -> bool {
+        if chars[*pos] == '}' {
+            *pos += 1;
+            return true;
         }
-
-        for lib_path in &self.library_folders {
-            let compatdata_path = lib_path
-                .join("compatdata")
-                .join(app_id)
-                .join("pfx");
-            if compatdata_path.exists() {
-                return Some(compatdata_path);
-            }
-        }
-
-        None
+        false
     }
 
-    pub fn get_game_info(&self, app_id: &str) -> GameInfo {
-        let mut result = GameInfo {
-            app_id: app_id.to_string(),
-            game_path: None,
-            proton_prefix: None,
-            library_path: None,
-            found: false,
-        };
-
-        if let Some((game_path, library_path)) = self.find_game_by_appid(app_id) {
-            result.game_path = Some(game_path);
-            result.library_path = Some(library_path.clone());
-            result.found = true;
-
-            if let Some(proton_prefix) = self.find_proton_prefix(app_id, Some(&library_path)) {
-                result.proton_prefix = Some(proton_prefix);
-            }
+    fn handle_opening_brace(chars: &[char], pos: &mut usize) -> bool {
+        if chars[*pos] == '{' {
+            *pos += 1;
+            return true;
         }
+        false
+    }
 
-        result
+    fn parse_key_value(
+        chars: &[char],
+        pos: &mut usize,
+        result: &mut HashMap<String, String>,
+        prefix: &str,
+        content: &str,
+    ) {
+        *pos += 1; // Skip opening quote
+        
+        let key = Self::read_quoted_string(chars, pos);
+        Self::skip_whitespace(chars, pos);
+
+        if *pos < chars.len() && chars[*pos] == '"' {
+            *pos += 1;
+            let value = Self::read_quoted_string(chars, pos);
+            let full_key = Self::build_key(prefix, &key);
+            result.insert(full_key, value);
+        } else if *pos < chars.len() && chars[*pos] == '{' {
+            *pos += 1;
+            let new_prefix = Self::build_key(prefix, &key);
+            Self::parse_recursive(content, pos, result, new_prefix);
+        }
+    }
+
+    fn read_quoted_string(chars: &[char], pos: &mut usize) -> String {
+        let mut s = String::new();
+        while *pos < chars.len() && chars[*pos] != '"' {
+            s.push(chars[*pos]);
+            *pos += 1;
+        }
+        *pos += 1; // Skip closing quote
+        s
+    }
+
+    fn build_key(prefix: &str, key: &str) -> String {
+        if prefix.is_empty() {
+            key.to_string()
+        } else {
+            format!("{}.{}", prefix, key)
+        }
     }
 }
